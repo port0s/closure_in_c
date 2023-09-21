@@ -1,0 +1,523 @@
+# 1. Introducion
+Este artigo propõe a consideração de uma construção de closure para C2x. A ideia chave de um closure é a de uma expressão de função com acesso lexical a variáveis declaradas no enclosing scope cuja vida pode exceder a vida útil desse enclosing scope Isso permite uma expressão sintática coveniente e eficiente de uma "unidade de trabalho", a tarefa em ISO/IEC parlance.
+
+
+## 1.1 History
+Closures estão no paper original de Alonso Church, sobre lambda. Implementações iniciais do LISP, entretanto, usada no escopo dinâmico, e as closures foram introduzidas por Guy Steele em SCHEME e depois em versões mais modernas de LISP. A Linguagem Smalltalk usa closures como a implementação de declaração composta em construções como if-then-else e loops. Ruby provê uma forma simples de closures e usa extensivamente para iteração em coleções e processamento (stream) de arquivos
+
+## 1.2 Background
+Esta proposta tem sua gênese dentro da Apple, Inc. no final de dezembro 2007 e rapidamente
+progrediu para uma versão alfa em maio de 2008, com mudanças de sintaxe e uma implementação completa
+a cerca de agosto de 2008, e um lançamento final como parte do "Snow Leopard" 10.6 da Apple
+lançado em agosto de 2009. Esta versão foi notável na época para duas coisas:
+era livre, e não tinha recursos além de desempenho. O ganho de desempenho foi
+bastante substancial e o resultado de retrabalho extenso para eliminar thread pools em favor de
+uma abordagem concorrente com base em closures como a "unidade de trabalho".
+
+Os closures, na Apple, foram introduzidos simultaneamente à linguagem C, bem como
+Objetivo-C e C++. Uma biblioteca de concurrency, com APIs em C, usa a forma de closures
+void (*)(void) para capturar trabalho anônimo sem parâmetros e sem retorno
+valor. Este tipo está disponível para todas as três linguagens, cada uma das quais tinha substancial
+comunidades dentro da Apple. Para C++, os closures suportam capturar qualquer objeto com uma cópia
+construtor, para Objective-C, os closures foram projetados para se tornar 
+Objetos Objective-C degenerados suficientes para participar de qualquer uma das duas formas de memória de objetos
+gestão: contagem de referência manual ou coleta de lixo conservador, independentemente
+de sua linguagem de origem. O uso de C é completamente especificado por closure_copy
+e closure_free como será discutido e não tem confiança nas instalações de gerenciamento de memória oferecidas por C++ ou Objective-C, ou Swift.
+
+Em 2014, a Apple introduziu a linguagem de programação Swift com suporte a closures.
+Microsoft deu suporte a programação Objective-C para IOS e Windows 10 é dito estar trabalhando no suporte Swift também
+
+Closures fornecem uma maneira expressiva de projetar APIs poderosas e foram usados
+extensivamente para retrofit existente e introduzir novas APIs. Foi dito que não se pode
+programa um Mac, iOS, watchOS, e agora aplicativo tvOS sem eles.
+
+Uma implementação de closures pode ser encontrada no código aberto do front-end do compilador LLVM, o "clang" 
+e projetos de runtimes onde eles são chamados "Blocks"
+
+Closures foram discutidos no WG14 em N1370 na reunião de Markham09 e especificamente
+proposta para C11 em N1451 de Florença10. A votação foi 6-5-4 a favor, não quase
+consenso, e, foi dito por abstentores, principalmente porque era tarde demais.
+
+Closures também foram apresentados e discutidos em "os primeiros dias" de CPLEX,
+"Closures vs Cilk_spawn" e-mails de 2013/07/13, e apresentados como uma alternativa geral
+para a maioria do que foi trabalhado como "task paralelas". Uma straw poll indicando que
+os fechamentos eram realmente muito interessantes e deviam ser tomados em WG14. A biblioteca que
+abordava isso, da Apple, foi mostrado para ser capaz de compor gráficos arbitrários de
+sincronização entre unidades de trabalho, incluindo, e além, paralelismo de fork-join (como
+OpenMP pode fazer).
+
+---
+
+# 2. Design
+Os objetivos de projeto para closures na Apple foram expressividade, integridade, eficiência,
+e segurança.
+
+## 2.1 Expressividade
+Embora os closures tivessem sido propostos ainda antes na Apple,
+uma nova linha de pensamento centrada na capacidade de capturar
+rapidamente uma função e seus argumentos para uso em outros lugares. 
+Considerando que Cilk faz:
+
+```
+    Cilk_spawn SomeFunction(expression1, expression2)
+```
+
+a ideia foi que, onde "^" é usado como um novo operador unary
+
+```
+    ^SomeFunction(expression1, expression2) // nunca implementado
+```
+
+dirigiria o compilador para produzir uma estrutura de dados
+"Cheap Invocation" em linguagem C de algum tipo
+que poderia ser usado de muitas maneiras diferentes,
+menos caro e mais universal
+do que o objeto de invocação da Fundação de Objective-C existente.
+
+Uma segunda ideia 
+foi que deveria ser possível 
+também fazer avaliação parcial da função 
+(muitas vezes confundida por mim como Currying), onde
+
+```
+    ^drawline(graphicsContext, _, _, _) // nunca implementado
+```
+
+produziria uma função que levou três argumentos e
+chamaria "drawline" com um contexto escondido (stashed) fora de "graphicsContext".
+
+A terceira ideia foi para closures,
+e uma vez que resultou que poderia fazer as outras duas ideias também, foi melhor, e mais expressivo,
+apenas ter um conceito geral em vez de três.
+
+A sintaxe evoluiu para introduzir ^ (caret)
+como um novo operador unário e como um indicador de closure em uma declaração.
+Caret (^) é usado para denotar ponteiro em closure.
+Muito parecido com a lambda de Alonso Church,
+a sintaxe para uma expressão de função é:
+caret, argumentos e corpo com um tipo de retorno,
+
+```
+    ^void (void) { SomeFunction(expression1, expression2); }
+```
+
+para a primeira ideia e
+
+```
+    ^void (float x, float y, float z) { drawline(graphicsContext, x, y, z); }
+```
+
+para o exemplo de avaliação parcial.
+
+Como um objeto de função, um objeto de closure não responde ao tamanho,
+ao contrário de uma função, não pode ser declarado e não tem nome 
+é uma expressão de função anônima. 
+Em vez disso, uma expressão de função produz um ponteiro para um closure.
+
+Estabelecer isso mais diretamente, 
+as expressões de função só aparecem após o novo operador unário ^ (caret), para a limpeza:
+
+```
+    dispatch_async(queue, ^void (void) { SomeFunction(expression1, expression2); });
+```
+
+Além disso, se o tipo de retorno de uma expressão de função
+pode ser inferido do tipo consistente de expressões de retorno, 
+ou falta dele, 
+a especificação do tipo de retorno pode ser omitida.
+Assim, a declaração acima também pode ser escrita
+
+```
+    dispatch_async(queue, ^(void) { SomeFunction(expression1, expression2); });
+```
+
+Ainda melhor, uma expressão de fechamento que tem um tipo de retorno inferido
+que também não tem argumentos,
+como é o caso aqui, pode ser escrito como:
+
+```
+    dispatch_sync(queue, ^{ SomeFunction(expression1, expression2); });
+```
+
+que é muito conciso e expressivo, especialmente porque isso capta o coração da unidade de trabalho
+
+Os ponteiros para fechamentos são declarados e de uma forma diretamente equivalente aos ponteiros para
+funções substituindo o caret (^) para asterísco (*) na declaração, para a limpeza:
+
+```
+    void (^closurePointer)(void) = ^{ SomeFunction(expression1, expression2); };
+```
+
+e chama, o ponteiro de função que pode ser:
+
+```
+    closurePointer();
+```
+
+## 2.2 Completeza
+No exemplo anterior, "expression1" e "expression2" foram destinados a sugerir
+que eles poderiam expandir para incluir qualquer variável no escopo,
+e em certa medida eles podem e fazem.
+
+No entanto, desde a duração de armazenamento de uma variável automática no escopo
+quando uma expressão de closure é avaliada
+uma versão "const" qualificada de cada variável com duração de armazenamento automática
+que é nomeada na expressão.
+
+Variáveis de outro armazenamento
+não tem suas durações capturadas e são referenciadas diretamente.
+
+Esta escolha de captura de "const" tem duas implicações.
+
+* proíbe a mutação de uma variável capturada, e
+* desalva a comunicação de volta ao escopo de closure para os casos em que o escopo de enclosing supera o closure
+
+A primeira restrição é relativamente menor.
+Para cada variável capturada do "const", uma versão não-"const" pode ser declarada na expressão da função,
+inicializada com a cópia capturada do "const" e mutada à vontade.
+Isso tem a vantagem de torná-lo muito explícito 
+que qualquer mutação na expressão da função 
+não vai voltar ao escopo de enclosing. 
+Aqui está um exemplo:
+
+```
+{
+    for (int index = 0; index < sizeof(array) / sizeof(element_t); ++index) {
+        iterate_linked_list(list, ^(list_item_t item) {
+            ...
+            int indexCopy = index;
+            while (indexCopy--) {
+                ...
+            }
+        });
+    }
+}
+```
+
+A noção chave de um verdadeiro closure 
+é a capacidade de não só ver mas compartilhar o acesso a variáveis automáticas dentro de seu escopo. 
+O compromisso desenvolvido para o closure da Apple 
+é exigir que a variável compartilhada seja declarada com uma nova classe de armazenamento compartilhada. 
+Aqui está um exemplo que compartilha entre o closure e o escopo de fechamento:
+
+```
+{
+    _Shared int maximum = -1;
+
+    for (int index = 0; index < sizeof(array) / sizeof(element_t); ++index) {
+        iterate_linked_list(list, ^(list_item_ref item) {
+            ...
+            if (item->member > maximum) maximum = item->member;
+            ...
+        });
+    }
+    if (maximum > THRESHOLD) { ... }
+}
+```
+
+Partilha também pode ocorrer entre muitos closures diferentes, 
+e que, claro, você pode criar closures dentro de closures.
+
+```
+{
+    _Shared int maximum = -1;
+
+    for (int index = 0; index < sizeof(array) / sizeof(element_t); ++index) {
+        iterate_linked_list(list, ^(list_item_ref item) {
+            ...
+            if (item->member > maximum) {
+                maximum = item->member;
+                dispatch_async(queue, ^{ ... index; ...; item; ...; maximum; ... });
+            }
+        });
+    }
+}
+```
+
+Neste exemplo, a chamada para dispatch_async capta o máximo e
+o índice do escopo e item mais profundo do interior
+para agendar qualquer trabalho em uma fila de trabalho assíncrona.
+Cada closure neste exemplo difere pelo valor das variáveis de índice e item capturados.
+
+Construções bastante complicadas podem ser feitas 
+- um closure pode atuar como um setter para uma variável compartilhada 
+e outro, no mesmo ou no âmbito relacionado, pode agir como um getter, 
+e ainda um terço pode usar a variável compartilhada efetivamente formando um objeto desconstruído. 
+Os closures podem referenciar várias variáveis compartilhadas.
+
+## 2.3 Eficiência
+Embora a concorrência fosse um objetivo principal,
+um menor forte era útil para usos síncronos,
+como iteradores de coleção onde a eficiência é primordial.
+
+Como tal, closures e variáveis compartilhadas são alocados na memória automática
+- cada um vive em uma struct personalizada escrita por compilador
+que tem um cabeçalho pequeno e, em seguida, o conteúdo.
+
+
+Para viver além da vida útil do contexto de enclosing,
+é necessário que o closure seja explicitamente copiado usando uma função genérica tipo "_Closure_copy":
+
+```
+    void dispatch_async(queue_ref q, void (^closure)(void)) {
+        queue_item_t *item = allocate_queue_item();
+        item->closure = _Closure_copy(closure);
+        ...
+    }
+```
+
+e quando feito, outro tipo de função genérica deve ser chamada 
+para recuperar os recursos de memória alocados:
+
+```
+    _Closure_free(item->closure);
+```
+
+Os closures e seu closure e suas referências variáveis compartilhadas formam uma DAG,
+não um grafo, e assim uma técnica de contagem de referência simples
+permite um closure já em memória alocada para simplesmente (atomicamente)
+incrementar um contador de referência interno
+em vez de alocar uma cópia adicional redundante para cada chamada adicional de _Closure_copy
+
+Esta escolha é, naturalmente, até à implementação.
+Os closures no escopo do arquivo não têm variáveis automáticas para capturar e
+uma implementação não precisa copiá-los para a memória alocada.
+
+Um ponto sutil aqui é que não há "este" ou "eu" nome dentro de um closure
+que refere o fechamento e isso garante que um DAG e um grafo não é fomado.
+Um gráfico terá recursos de memória não recuperáveis se copiado 
+a menos que alguma forma de coleta de lixo de ciclo de referência seja empregada.
+
+_Shared as variáveis que se destinam a ser acessadas 
+a partir de múltiplos fios também serão _Atomic
+para evitar data races (corrida de dados, condição de corrida)
+
+A maior surpresa do campo
+foi o tratamento de matrizes em armazenamento automático.
+Eles são constantemente copiados para o closure.
+Uma vez que as pilhas
+que não são principais
+são bastante pequenas, isso não é uma desvantagem enorme, e
+para aqueles casos em que o array é acessado de forma síncrona (o fechamento não é copiado),
+um ponteiro para o array pode ser formado e o ponteiro capturado.
+VLAs não são copiados.
+
+```
+{
+    point_t array[32];
+    ...
+
+    point_t parray[32][] = array;
+
+    iterate_linked_list(list, ^(list_item_ref item) {
+        if (parray[item->index].color == RED) { ... }
+    });
+}
+```
+
+Além da biblioteca de fila de concorrência até agora discutida,
+os closures são copiados e usados assincronamente por quase todas as bibliotecas da Apple.
+As bibliotecas GUI da Apple usam closures para
+vincular anonimamente dados do cliente a ações instigadas pela interface gráfica do usuário.
+As bibliotecas de rede usam closures copiados para lidar assíncronamente com dados de entrada,
+condições de rescisão e outros assuntos.
+
+Esta é a solução geral que elimina os parâmetros vazios *
+que são passados para funções fornecidas,
+como no caso de síncrono qsort, exceto em contextos assíncronos.
+
+# 2.4 Safety
+Um objetivo importante do trabalho 
+era que qualquer e todos os closures pudessem ser copiados e usados assíncronos. 
+O programador não pode ser impedido, por exemplo, 
+de capturar ponteiros para variáveis automáticas locais e 
+causar comportamento indefinido, ou havoc de outras maneiras. 
+Mas quando a formulação padrão é mais segura, eficiente, concisa e eloquente, 
+o resultado final é mais seguro e provável programas mais corretos, 
+e mais rapidamente também, 
+e isso tem que ser considerado sobre um conjunto de facas de mão-de-obra suíça de opções para se ferir com. 
+Esta proposta é sobre tornar as coisas simples coisas fáceis e difíceis possíveis.
+
+---
+
+# 3 Implementação
+Uma expressão de função é simples de implementar.
+Como com uma função, um closure tem um tipo de retorno e uma lista de argumentos
+que formam seu nome de tipo, e
+uma lista de variáveis capturadas com seus tipos,
+e uma lista de variáveis _Shared com seus tipos.
+
+Vamos discutir a variável compartilhada primeiro. 
+No exemplo acima de onde há um:
+
+```
+    _Shared int maximum
+```
+
+o compilador reescreve a declaração para ser uma struct localmente única:
+
+```
+    struct __shared_1234 {
+        struct __shared_variable_header header;
+        volatile struct __shared_1234 *stack_or_heap;
+        volatile _Atomic int maximum;
+    } __shared_1234;
+```
+
+Uma vez que a expressão da função é analisada,
+uma struct personalizada é formada para cada expressão da função e,
+após um cabeçalho comum,
+a lista de variáveis capturadas é adicionada à struct em um formulário qualificado "const",
+e ponteiros para cada variável _Shared são declarados.
+
+A struct está prevista para ser emitida no escopo do arquivo.
+Em seguida, a função de implementação de closure personalizada é formada
+usando o tipo de retorno e argumentos.
+
+Um ponteiro para a struct personalizada
+é inserido como um primeiro argumento secreto com um compilador escolhido nome oculto:
+
+```
+_select
+```
+
+e o corpo da closure é reescrito usando:
+
+```
+_secret->
+```
+
+para todas as variáveis capturadas.
+
+A variável _Shared é reescrita como:
+
+```
+    _secret->stack_or_heap->shared
+```
+
+e a Implementações da função customizada é emitida.
+
+Assim, para a expressão 
+
+```
+    ^{ ... index; ...; item; ...; maximum; ... }
+```
+
+o compilador emite no escopo do arquivo:
+
+```
+    struct __closure_abcd {
+        struct __closure_header header; // common
+        const int index;
+        const list_item_ref item;
+        volatile struct __shared_1234 * __shared_1234;
+    };
+
+    static void __closure_abcd_implementation(struct __closure_abcd *__secret) {
+        ...;
+        __secret->index;
+        ...;
+        __secret->item;
+        ...;
+        __secret->stack_or_heap->maximum;
+        ...;
+    }
+```
+
+A variável _Shared são declaradas em uma struct personalizada
+com um ponteiro para si mesmo antes da variável.
+
+Quando copiado, o ponteiro é redefinido para a cópia de memória alocada,
+e a cópia também tem seu ponteiro inicializado com um ponteiro para si mesmo,
+a cópia de memória alocada.
+
+O ponteiro dentro do cabeçalho é declarado volátil
+para garantir que ele é recarregado cada vez que é usado,
+garantindo assim que cada acesso vê a versão mais recente e
+especialmente que captura a transição para a memória alocada.
+
+Esta não é uma data race (corrida de dados, codição de corrida); 
+é um comportamento indefinido se um closure é usado de um segmento secundário sem ser copiado. 
+
+A cópia é feita da linha original sincronizada.
+
+---
+
+4 Proposta
+A biblioteca de concurrency da Apple: Grand Central Dispatch (GCD)
+foi aberta e está disponível no Linux e no FreeBSD.
+A linguagem de programação Swift está se movendo para Linux e IBM,
+e assim os closures da Apple têm, em algum grau,
+se tornar parte do ABI nessas plataformas.
+
+WG14 está em uma excelente posição para simplesmente adotar esta prática
+da indústria existente em vez do que reprojetá-lo,
+e recomendo fortemente este curso geral de ação.
+
+Há, naturalmente, lugares onde WG14 pode adicionar valor.
+
+## 4.1 Library
+Estes são possivelmente novos pontos de entrada da biblioteca
+que poderiam ser adicionados.
+Os três seguintes vêm à mente rapidamente,
+particularmente porque dois já têm práticas estabelecidas em plataformas Apple.
+
+### 4.1.1 thrd_create
+Além da função existente 7.26.5.1 "thrd_create"
+```
+    typedef int (*thrd_start_t)(void *);
+    int thrd_create(thrd_t *thr, thrd_start_t_ func, void *arg);
+```
+
+WG14 poderia adicionar
+
+```
+    typedef int (^thrd_start_closure_t)(void);
+    int thrd_create_c(thrd_t *thr, thrd_start_closure_t closure);
+```
+
+que elimina a necessidade do programador
+para escrever uma função e fazer casting de "void *"
+a quaisquer parâmetros de interesse.
+
+### 4.1.2 qsort
+Além de
+```
+    void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *));
+```
+
+WG14 poderia, como a Apple fez, fornecer
+
+```
+    void qsort_b(void *base, size_t nmemb, size_t size, int (^compar)(const void *, const void *));
+```
+
+para que as variações na classificação determinada no tempo de execução
+possam ser facilmente codificadas em um fechamento.
+
+### 4.1.3 bsearch
+Em adição a
+```
+    void *bsearch(const void *key, const void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *));
+```
+
+WG14 poderia, como a Apple fez, fornecer
+
+```
+    void *bsearch_b(const void *key, const void *base, size_t nmemb, size_t size, int (^compar)(const void *, const void *));
+```
+
+# 5 Processos
+C11 está considerando a criação de um TC2
+que incorpora as alterações de sintaxe e
+outras edições de Relatórios de Defeito fechados.
+
+As alterações sintáticas, para esta proposta,
+foram elaboradas em N1451 e precisam de revisão.
+
+Dependendo do interesse, um papel adicional pode ser desenvolvido e
+forneceria mudanças e restrições sintáticas detalhadas.
+Neste ponto, tal detalhe parece prematuro.
+
+Blaine Garst
